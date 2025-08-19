@@ -391,6 +391,7 @@ def callback():
     """
 
 
+
 @app.route("/exchange_token", methods=["POST"])
 def exchange_token():
     """Обмен кода на токен (выполняется на бэкенде для безопасности)"""
