@@ -5,7 +5,7 @@ import hashlib
 import base64
 
 app = Flask(__name__)
-
+app.secret_key = "super secret key"
 # Данные клиентов
 # Данные клиентов
 clients = {
@@ -342,7 +342,7 @@ def login_approve():
 
         # Проверяем что сессия не устарела (защита от CSRF)
         if time.time() - auth_data.get("timestamp", 0) > 300:  # 5 минут
-            session.clear()
+            #session.clear()
             return "❌ Сессия устарела", 400
 
         # Проверяем пользователя

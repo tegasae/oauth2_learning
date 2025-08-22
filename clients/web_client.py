@@ -261,7 +261,8 @@ def generate_code_challenge(verifier):
 @app.route("/")
 def home():
     """Главная страница"""
-    session.clear()
+    #session.
+    #session.clear()
     return render_template_string(SCOPE_SELECTION_TEMPLATE)
 
 
