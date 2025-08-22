@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, redirect, render_template_string
+from flask import Flask, request, jsonify, redirect, render_template_string, session
 import secrets
 import time
 import hashlib
@@ -7,18 +7,21 @@ import base64
 app = Flask(__name__)
 
 # Данные клиентов
+# Данные клиентов
 clients = {
     "web_app": {
         "secret": "web_secret_123",
         "scopes": ["read_data", "write_data", "admin_panel"],
         "name": "Веб-приложение",
-        "type": "public"  # Может хранить секрет
+        "type": "confidential",
+        "redirect_uris": ["http://127.0.0.1:5003/callback"]  # ← Добавить!
     },
     "mobile_app": {
         "secret": "mobile_secret_456",
         "scopes": ["read_data"],
         "name": "Мобильное приложение",
-        "type": "public"  # Не должен использовать секрет в запросах
+        "type": "public",
+        "redirect_uris": ["http://127.0.0.1:5004/callback"]  # ← Добавить!
     }
 }
 
@@ -82,10 +85,24 @@ LOGIN_TEMPLATE = """
             border: none; border-radius: 4px; cursor: pointer; 
         }
         .info { background: #f8f9fa; padding: 15px; border-radius: 4px; margin: 20px 0; }
+        .error { 
+            background: #ffe6e6; 
+            color: #dc3545; 
+            padding: 15px; 
+            border-radius: 4px; 
+            margin: 20px 0;
+            border-left: 4px solid #dc3545;
+        }
     </style>
 </head>
 <body>
     <h2>🔐 Авторизация</h2>
+
+    {% if error_message %}
+    <div class="error">
+        <strong>❌ Ошибка:</strong> {{ error_message }}
+    </div>
+    {% endif %}
 
     <div class="info">
         <strong>Приложение:</strong> {{ client_name }}<br>
@@ -98,6 +115,9 @@ LOGIN_TEMPLATE = """
         <input type="hidden" name="requested_scope" value="{{ requested_scope_str }}">
         <input type="hidden" name="code_challenge" value="{{ code_challenge }}">
         <input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
+        {% if state %}
+        <input type="hidden" name="state" value="{{ state }}">
+        {% endif %}
 
         <div class="form-group">
             <label>Логин:</label>
@@ -120,6 +140,7 @@ LOGIN_TEMPLATE = """
 </body>
 </html>
 """
+
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -241,23 +262,52 @@ def home():
 @app.route("/authorize", methods=["GET"])
 def authorize():
     """Страница авторизации OAuth2 с поддержкой PKCE"""
+    # Получаем параметры из запроса
     client_id = request.args.get("client_id")
     redirect_uri = request.args.get("redirect_uri")
     requested_scope = request.args.get("scope", "").split()
     code_challenge = request.args.get("code_challenge")
     code_challenge_method = request.args.get("code_challenge_method", "plain")
+    state = request.args.get("state")  # Опциональный параметр для CSRF защиты
 
-    if client_id not in clients:
+    # Валидация обязательных параметров
+    if not client_id:
         return "❌ Неверный client_id", 400
 
     if not redirect_uri:
         return "❌ Отсутствует redirect_uri", 400
 
-    # Для публичных клиентов требовать PKCE
-    if clients[client_id]["type"] == "public" and not code_challenge:
+    # Проверяем зарегистрирован ли клиент
+    if client_id not in clients:
+        return "❌ Неизвестный client_id", 400
+
+    # Для публичных клиентов требуем PKCE
+    client = clients[client_id]
+    if client.get("type") == "public" and not code_challenge:
         return "❌ Публичные клиенты должны использовать PKCE (требуется code_challenge)", 400
 
-    client_name = clients[client_id].get("name", client_id)
+    # Проверяем scope (опционально, но рекомендуется)
+    client_scopes = client.get("scopes", [])
+    invalid_scopes = [s for s in requested_scope if s not in client_scopes]
+    if invalid_scopes:
+        return f"❌ Неподдерживаемые scope: {', '.join(invalid_scopes)}", 400
+
+    # Сохраняем данные авторизации в сессии для использования в форме
+    session["authorize_data"] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,  # ← КРИТИЧЕСКИ ВАЖНО!
+        "requested_scope": requested_scope,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "state": state,
+        "timestamp": time.time()
+    }
+
+    # Очищаем старые данные (защита от replay)
+    session.pop("auth_error", None)
+
+    # Показываем страницу авторизации
+    client_name = client.get("name", client_id)
 
     return render_template_string(
         LOGIN_TEMPLATE,
@@ -267,7 +317,8 @@ def authorize():
         requested_scope=requested_scope,
         requested_scope_str=" ".join(requested_scope),
         code_challenge=code_challenge or "",
-        code_challenge_method=code_challenge_method
+        code_challenge_method=code_challenge_method,
+        state=state or ""
     )
 
 
@@ -275,41 +326,89 @@ def authorize():
 def login_approve():
     """Обработка формы авторизации с сохранением PKCE данных"""
     try:
-        client_id = request.form["client_id"]
+        # Получаем данные из сессии
+        auth_data = session.get("authorize_data", {})
+
+        client_id = auth_data.get("client_id")
+        redirect_uri = auth_data.get("redirect_uri")  # ← Важно!
+        requested_scope = auth_data.get("requested_scope", [])
+        code_challenge = auth_data.get("code_challenge")
+        code_challenge_method = auth_data.get("code_challenge_method", "plain")
+        state = auth_data.get("state")
+
+        # Получаем данные из формы
         username = request.form["username"]
         password = request.form["password"]
-        redirect_uri = request.form["redirect_uri"]
-        requested_scope = request.form.get("requested_scope", "").split()
-        code_challenge = request.form.get("code_challenge")
-        code_challenge_method = request.form.get("code_challenge_method", "plain")
+
+        # Проверяем что сессия не устарела (защита от CSRF)
+        if time.time() - auth_data.get("timestamp", 0) > 300:  # 5 минут
+            session.clear()
+            return "❌ Сессия устарела", 400
 
         # Проверяем пользователя
         if username not in users or users[username]["password"] != password:
-            return "❌ Неверный логин или пароль", 401
+            # Сохраняем ошибку в сессии для показа на форме
+            session["auth_error"] = "Неверный логин или пароль"
+            return render_template_string(
+                LOGIN_TEMPLATE,
+                client_id=client_id,
+                client_name=clients[client_id].get("name", client_id),
+                redirect_uri=redirect_uri,
+                requested_scope=requested_scope,
+                requested_scope_str=" ".join(requested_scope),
+                code_challenge=code_challenge or "",
+                code_challenge_method=code_challenge_method,
+                error_message="Неверный логин или пароль"
+            ), 401
 
-        # Проверяем scope
+        # Проверяем scope пользователя
         user_scopes = users[username]["scopes"]
         allowed_scope = [s for s in requested_scope if s in user_scopes]
 
         if not allowed_scope:
-            return "❌ У пользователя нет запрашиваемых прав", 403
+            session["auth_error"] = "Недостаточно прав"
+            return render_template_string(
+                LOGIN_TEMPLATE,
+                client_id=client_id,
+                client_name=clients[client_id].get("name", client_id),
+                redirect_uri=redirect_uri,
+                requested_scope=requested_scope,
+                requested_scope_str=" ".join(requested_scope),
+                code_challenge=code_challenge or "",
+                code_challenge_method=code_challenge_method,
+                error_message="У пользователя нет запрашиваемых прав"
+            ), 403
 
         # Генерируем код авторизации
         code = secrets.token_urlsafe(16)
+
+        # Сохраняем код с ВСЕМИ данными для последующей проверки
         authorization_codes[code] = {
             "client_id": client_id,
             "user_id": username,
             "scope": allowed_scope,
             "expires_at": time.time() + 300,  # 5 минут
-            "code_challenge": code_challenge,  # Сохраняем PKCE challenge
-            "code_challenge_method": code_challenge_method
+            "code_challenge": code_challenge,  # Для PKCE
+            "code_challenge_method": code_challenge_method,
+            "redirect_uri": redirect_uri,  # ← КРИТИЧЕСКИ ВАЖНО!
+            "state": state  # Для CSRF защиты
         }
 
-        return redirect(f"{redirect_uri}?code={code}")
+        # Очищаем данные сессии
+        session.pop("authorize_data", None)
+        session.pop("auth_error", None)
 
+        # Формируем URL для redirect с кодом
+        redirect_url = f"{redirect_uri}?code={code}"
+        if state:
+            redirect_url += f"&state={state}"
+
+        return redirect(redirect_url)
+
+    except KeyError as e:
+        return f"❌ Отсутствует обязательный параметр: {e}", 400
     except Exception as e:
         return f"❌ Ошибка сервера: {e}", 500
-
 
 @app.route("/token", methods=["POST"])
 def issue_token():

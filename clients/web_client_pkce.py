@@ -10,7 +10,7 @@ app.secret_key = secrets.token_hex(16)
 
 # Конфигурация
 AUTH_SERVER = "http://127.0.0.1:5000"
-RESOURCE_API = "http://127.0.0.1:5001"
+RESOURCE_API = "http://127.0.0.1:5011"
 CLIENT_ID = "web_app"
 REDIRECT_URI = "http://127.0.0.1:5004/callback"
 
