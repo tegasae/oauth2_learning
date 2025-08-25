@@ -1,31 +1,47 @@
-from flask import Flask, request, jsonify, redirect, render_template_string, session
+from flask import Flask, request, jsonify, redirect, render_template_string
 import secrets
 import time
 import hashlib
 import base64
+import jwt
+import datetime
+from typing import Dict, List, Optional, Tuple
 
 app = Flask(__name__)
-app.secret_key = "super secret key"
-# Данные клиентов
-# Данные клиентов
+app.secret_key = "super-secret-jwt-key-2024"  # Для JWT подписи
+
+# =============================================================================
+# КОНФИГУРАЦИЯ И НАСТРОЙКИ
+# =============================================================================
+
+# JWT конфигурация
+JWT_CONFIG = {
+    "algorithm": "HS256",
+    "access_token_expiry": datetime.timedelta(minutes=15),  # 15 минут
+    "refresh_token_expiry": datetime.timedelta(days=7),  # 7 дней
+    "issuer": "oauth2-auth-server",
+    "audience": "resource-server"
+}
+
+# Данные клиентов (OAuth 2.0 clients)
 clients = {
     "web_app": {
         "secret": "web_secret_123",
         "scopes": ["read_data", "write_data", "admin_panel"],
         "name": "Веб-приложение",
         "type": "confidential",
-        "redirect_uris": ["http://127.0.0.1:5003/callback"]  # ← Добавить!
+        "redirect_uris": ["http://127.0.0.1:5003/callback"]
     },
     "mobile_app": {
         "secret": "mobile_secret_456",
         "scopes": ["read_data"],
         "name": "Мобильное приложение",
         "type": "public",
-        "redirect_uris": ["http://127.0.0.1:5004/callback"]  # ← Добавить!
+        "redirect_uris": ["http://127.0.0.1:5004/callback"]
     }
 }
 
-# Пользователи с разными правами
+# Пользователи системы
 users = {
     "alice": {
         "password": "password123",
@@ -39,34 +55,170 @@ users = {
     }
 }
 
-# Хранилища
-tokens = {}
-authorization_codes = {}
-revoked_tokens = set()
+# Хранилища данных
+authorization_codes = {}  # Коды авторизации {code: data}
+refresh_tokens = {}  # Refresh tokens {token: data}
+revoked_tokens = set()  # Отозванные токены (blacklist)
+auth_requests = {}  # Временные токены для авторизационных запросов {token: data}
 
 
-def generate_token():
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =============================================================================
+
+def generate_token() -> str:
+    """Генерирует случайный токен для refresh tokens и authorization codes"""
     return secrets.token_urlsafe(32)
 
 
-def validate_pkce(code_verifier, stored_challenge, challenge_method):
-    """Проверяет PKCE code_verifier против stored_challenge"""
+def validate_pkce(code_verifier: str, stored_challenge: str, challenge_method: str) -> bool:
+    """
+    Проверяет PKCE code_verifier против stored_challenge
+
+    Args:
+        code_verifier: Секретная строка от клиента
+        stored_challenge: Challenge из authorization code
+        challenge_method: Метод хеширования (S256 или plain)
+
+    Returns:
+        bool: True если верификация успешна
+    """
     if not stored_challenge or not code_verifier:
         return False
 
     if challenge_method == "S256":
-        # Вычисляем хеш от code_verifier
         digest = hashlib.sha256(code_verifier.encode()).digest()
         calculated_challenge = base64.urlsafe_b64encode(digest).decode().replace('=', '')
         return calculated_challenge == stored_challenge
     elif challenge_method == "plain":
-        # Простое сравнение (менее безопасно)
         return code_verifier == stored_challenge
     else:
         return False
 
 
-# HTML шаблоны (остаются без изменений)
+def create_access_token(user_id: str, client_id: str, scopes: List[str]) -> str:
+    """
+    Создает JWT access token
+
+    Args:
+        user_id: ID пользователя
+        client_id: ID клиента
+        scopes: Список прав доступа
+
+    Returns:
+        str: JWT токен
+    """
+    now = datetime.datetime.utcnow()
+
+    payload = {
+        "sub": user_id,  # Subject (пользователь)
+        "client_id": client_id,  # Клиентское приложение
+        "scopes": scopes,  # Права доступа
+        "iat": now,  # Issued at
+        "exp": now + JWT_CONFIG["access_token_expiry"],  # Expiration
+        "iss": JWT_CONFIG["issuer"],  # Issuer
+        "aud": JWT_CONFIG["audience"],  # Audience
+        "jti": secrets.token_urlsafe(16),  # Unique token ID
+        "type": "access"  # Token type
+    }
+
+    return jwt.encode(payload, app.secret_key, algorithm=JWT_CONFIG["algorithm"])
+
+
+def create_refresh_token(user_id: str, client_id: str, scopes: List[str]) -> Tuple[str, dict]:
+    """
+    Создает refresh token (не-JWT, хранится в базе)
+
+    Args:
+        user_id: ID пользователя
+        client_id: ID клиента
+        scopes: Список прав доступа
+
+    Returns:
+        Tuple[str, dict]: (refresh_token, token_data)
+    """
+    token = generate_token()
+    now = time.time()
+
+    token_data = {
+        "user_id": user_id,
+        "client_id": client_id,
+        "scopes": scopes,
+        "created_at": now,
+        "expires_at": now + JWT_CONFIG["refresh_token_expiry"].total_seconds(),
+        "last_used": None
+    }
+
+    refresh_tokens[token] = token_data
+    return token, token_data
+
+
+def verify_jwt_token(token: str) -> Tuple[bool, Optional[dict]]:
+    """
+    Проверяет JWT access token
+
+    Args:
+        token: JWT токен для проверки
+
+    Returns:
+        Tuple[bool, Optional[dict]]: (is_valid, payload_or_error)
+    """
+    try:
+        # Проверяем отозванные токены
+        if token in revoked_tokens:
+            return False, {"error": "Token revoked"}
+
+        # Декодируем и проверяем JWT
+        payload = jwt.decode(
+            token,
+            app.secret_key,
+            algorithms=[JWT_CONFIG["algorithm"]],
+            issuer=JWT_CONFIG["issuer"],
+            audience=JWT_CONFIG["audience"]
+        )
+
+        # Дополнительная проверка типа токена
+        if payload.get("type") != "access":
+            return False, {"error": "Invalid token type"}
+
+        return True, payload
+
+    except jwt.ExpiredSignatureError:
+        return False, {"error": "Token expired"}
+    except jwt.InvalidTokenError as e:
+        return False, {"error": f"Invalid token: {str(e)}"}
+
+
+def verify_refresh_token(token: str) -> Tuple[bool, Optional[dict]]:
+    """
+    Проверяет refresh token
+
+    Args:
+        token: Refresh token для проверки
+
+    Returns:
+        Tuple[bool, Optional[dict]]: (is_valid, token_data_or_error)
+    """
+    if token not in refresh_tokens:
+        return False, {"error": "Invalid refresh token"}
+
+    token_data = refresh_tokens[token]
+
+    # Проверяем срок действия
+    if time.time() > token_data["expires_at"]:
+        del refresh_tokens[token]
+        return False, {"error": "Refresh token expired"}
+
+    # Обновляем время последнего использования
+    token_data["last_used"] = time.time()
+
+    return True, token_data
+
+
+# =============================================================================
+# HTML ШАБЛОНЫ
+# =============================================================================
+
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -110,6 +262,7 @@ LOGIN_TEMPLATE = """
     </div>
 
     <form method="POST" action="/login_approve">
+        <input type="hidden" name="auth_token" value="{{ auth_token }}">
         <input type="hidden" name="client_id" value="{{ client_id }}">
         <input type="hidden" name="redirect_uri" value="{{ redirect_uri }}">
         <input type="hidden" name="requested_scope" value="{{ requested_scope_str }}">
@@ -142,73 +295,9 @@ LOGIN_TEMPLATE = """
 """
 
 
-ADMIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Админ-панель</title>
-    <meta charset="utf-8">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        table { border-collapse: collapse; width: 100%; margin: 20px 0; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
-        .stats { display: flex; gap: 20px; margin: 20px 0; }
-        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 5px; }
-    </style>
-</head>
-<body>
-    <h2>⚙️ Админ-панель управления токенами</h2>
-
-    <div class="stats">
-        <div class="stat-card">
-            <h3>📊 Статистика</h3>
-            <p>Активных токенов: <strong>{{ active_count }}</strong></p>
-            <p>Отозванных токенов: <strong>{{ revoked_count }}</strong></p>
-        </div>
-    </div>
-
-    <h3>🔑 Активные токены</h3>
-    {% if tokens_list %}
-    <table>
-        <tr>
-            <th>Токен (первые 10 символов)</th>
-            <th>Пользователь</th>
-            <th>Клиент</th>
-            <th>Права</th>
-            <th>Действия</th>
-        </tr>
-        {% for token, data in tokens_list %}
-        <tr>
-            <td><code>{{ token[:10] }}...</code></td>
-            <td>{{ data.user_id }}</td>
-            <td>{{ data.client_id }}</td>
-            <td>{{ data.scope }}</td>
-            <td>
-                <form method="post" action="/admin/revoke" style="display: inline;">
-                    <input type="hidden" name="token" value="{{ token }}">
-                    <button type="submit" style="background: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer;">
-                        Отозвать
-                    </button>
-                </form>
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
-    {% else %}
-    <p>Нет активных токенов</p>
-    {% endif %}
-
-    <h3>🚫 Отозванные токены</h3>
-    <p>Всего отозвано: {{ revoked_count }}</p>
-
-    <div style="margin-top: 30px;">
-        <a href="/">← На главную</a>
-    </div>
-</body>
-</html>
-"""
-
+# =============================================================================
+# OAUTH 2.0 ENDPOINTS
+# =============================================================================
 
 @app.route("/")
 def home():
@@ -225,24 +314,26 @@ def home():
         </style>
     </head>
     <body>
-        <h1>🚀 OAuth2 Сервер авторизации</h1>
+        <h1>🚀 OAuth2 Сервер авторизации (JWT)</h1>
 
         <div class="card">
             <h2>📊 Статистика системы</h2>
             <p>Зарегистрированных клиентов: <strong>{len(clients)}</strong></p>
             <p>Пользователей: <strong>{len(users)}</strong></p>
-            <p>Активных токенов: <strong>{len(tokens)}</strong></p>
+            <p>Активных кодов авторизации: <strong>{len(authorization_codes)}</strong></p>
+            <p>Активных refresh токенов: <strong>{len(refresh_tokens)}</strong></p>
             <p>Отозванных токенов: <strong>{len(revoked_tokens)}</strong></p>
+            <p>Активных auth запросов: <strong>{len(auth_requests)}</strong></p>
         </div>
 
         <div class="card">
             <h2>🔧 Доступные endpoints</h2>
             <ul>
                 <li><code>GET /authorize</code> - Страница авторизации</li>
-                <li><code>POST /token</code> - Получение токена</li>
-                <li><code>POST /verify_token</code> - Проверка токена</li>
+                <li><code>POST /token</code> - Получение токенов (JWT)</li>
+                <li><code>POST /verify_token</code> - Проверка JWT токена</li>
                 <li><code>POST /revoke</code> - Отзыв токена</li>
-                <li><code>GET /admin/tokens</code> - Админ-панель</li>
+                <li><code>POST /refresh</code> - Обновление токенов</li>
             </ul>
         </div>
 
@@ -261,41 +352,43 @@ def home():
 
 @app.route("/authorize", methods=["GET"])
 def authorize():
-    """Страница авторизации OAuth2 с поддержкой PKCE"""
-    # Получаем параметры из запроса
+    """
+    OAuth 2.0 Authorization Endpoint
+    Возвращает HTML форму для аутентификации пользователя
+    """
+    # Извлекаем параметры из запроса
     client_id = request.args.get("client_id")
     redirect_uri = request.args.get("redirect_uri")
     requested_scope = request.args.get("scope", "").split()
     code_challenge = request.args.get("code_challenge")
     code_challenge_method = request.args.get("code_challenge_method", "plain")
-    state = request.args.get("state")  # Опциональный параметр для CSRF защиты
+    state = request.args.get("state")
 
-    # Валидация обязательных параметров
-    if not client_id:
-        return "❌ Неверный client_id", 400
+    # Валидация параметров
+    if not client_id or not redirect_uri:
+        return "❌ Неверные параметры: client_id и redirect_uri обязательны", 400
 
-    if not redirect_uri:
-        return "❌ Отсутствует redirect_uri", 400
-
-    # Проверяем зарегистрирован ли клиент
     if client_id not in clients:
         return "❌ Неизвестный client_id", 400
 
-    # Для публичных клиентов требуем PKCE
     client = clients[client_id]
-    if client.get("type") == "public" and not code_challenge:
-        return "❌ Публичные клиенты должны использовать PKCE (требуется code_challenge)", 400
 
-    # Проверяем scope (опционально, но рекомендуется)
-    client_scopes = client.get("scopes", [])
-    invalid_scopes = [s for s in requested_scope if s not in client_scopes]
+    # Проверка PKCE для public clients
+    if client["type"] == "public" and not code_challenge:
+        return "❌ Публичные клиенты должны использовать PKCE", 400
+
+    # Проверка разрешенных scopes
+    invalid_scopes = [s for s in requested_scope if s not in client["scopes"]]
     if invalid_scopes:
         return f"❌ Неподдерживаемые scope: {', '.join(invalid_scopes)}", 400
 
-    # Сохраняем данные авторизации в сессии для использования в форме
-    session["authorize_data"] = {
+    # Генерируем одноразовый токен для этого запроса авторизации
+    auth_token = generate_token()
+
+    # Сохраняем данные авторизации
+    auth_requests[auth_token] = {
         "client_id": client_id,
-        "redirect_uri": redirect_uri,  # ← КРИТИЧЕСКИ ВАЖНО!
+        "redirect_uri": redirect_uri,
         "requested_scope": requested_scope,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
@@ -303,16 +396,12 @@ def authorize():
         "timestamp": time.time()
     }
 
-    # Очищаем старые данные (защита от replay)
-    session.pop("auth_error", None)
-
-    # Показываем страницу авторизации
-    client_name = client.get("name", client_id)
-
+    # Показываем форму авторизации
     return render_template_string(
         LOGIN_TEMPLATE,
+        auth_token=auth_token,
         client_id=client_id,
-        client_name=client_name,
+        client_name=client["name"],
         redirect_uri=redirect_uri,
         requested_scope=requested_scope,
         requested_scope_str=" ".join(requested_scope),
@@ -324,81 +413,88 @@ def authorize():
 
 @app.route("/login_approve", methods=["POST"])
 def login_approve():
-    """Обработка формы авторизации с сохранением PKCE данных"""
+    """
+    Обработка формы авторизации
+    Создает authorization code и перенаправляет на redirect_uri
+    """
     try:
-        # Получаем данные из сессии
-        auth_data = session.get("authorize_data", {})
+        # Получаем auth token из формы
+        auth_token = request.form["auth_token"]
 
-        client_id = auth_data.get("client_id")
-        redirect_uri = auth_data.get("redirect_uri")  # ← Важно!
-        requested_scope = auth_data.get("requested_scope", [])
-        code_challenge = auth_data.get("code_challenge")
-        code_challenge_method = auth_data.get("code_challenge_method", "plain")
-        state = auth_data.get("state")
+        # Проверяем существование и валидность auth token
+        if auth_token not in auth_requests:
+            return "❌ Недействительный запрос авторизации", 400
 
-        # Получаем данные из формы
+        auth_data = auth_requests[auth_token]
+
+        # Проверяем время жизни запроса (5 минут)
+        if time.time() - auth_data["timestamp"] > 300:
+            del auth_requests[auth_token]
+            return "❌ Запрос авторизации устарел", 400
+
+        # Извлекаем данные
+        client_id = auth_data["client_id"]
+        redirect_uri = auth_data["redirect_uri"]
+        requested_scope = auth_data["requested_scope"]
+        code_challenge = auth_data["code_challenge"]
+        code_challenge_method = auth_data["code_challenge_method"]
+        state = auth_data["state"]
+
+        # Получаем учетные данные из формы
         username = request.form["username"]
         password = request.form["password"]
 
-        # Проверяем что сессия не устарела (защита от CSRF)
-        if time.time() - auth_data.get("timestamp", 0) > 300:  # 5 минут
-            #session.clear()
-            return "❌ Сессия устарела", 400
-
-        # Проверяем пользователя
+        # Аутентификация пользователя
         if username not in users or users[username]["password"] != password:
-            # Сохраняем ошибку в сессии для показа на форме
-            session["auth_error"] = "Неверный логин или пароль"
             return render_template_string(
                 LOGIN_TEMPLATE,
+                auth_token=auth_token,
                 client_id=client_id,
-                client_name=clients[client_id].get("name", client_id),
+                client_name=clients[client_id]["name"],
                 redirect_uri=redirect_uri,
                 requested_scope=requested_scope,
                 requested_scope_str=" ".join(requested_scope),
                 code_challenge=code_challenge or "",
                 code_challenge_method=code_challenge_method,
+                state=state or "",
                 error_message="Неверный логин или пароль"
             ), 401
 
-        # Проверяем scope пользователя
+        # Проверка прав доступа
         user_scopes = users[username]["scopes"]
         allowed_scope = [s for s in requested_scope if s in user_scopes]
-
         if not allowed_scope:
-            session["auth_error"] = "Недостаточно прав"
             return render_template_string(
                 LOGIN_TEMPLATE,
+                auth_token=auth_token,
                 client_id=client_id,
-                client_name=clients[client_id].get("name", client_id),
+                client_name=clients[client_id]["name"],
                 redirect_uri=redirect_uri,
                 requested_scope=requested_scope,
                 requested_scope_str=" ".join(requested_scope),
                 code_challenge=code_challenge or "",
                 code_challenge_method=code_challenge_method,
+                state=state or "",
                 error_message="У пользователя нет запрашиваемых прав"
             ), 403
 
-        # Генерируем код авторизации
-        code = secrets.token_urlsafe(16)
-
-        # Сохраняем код с ВСЕМИ данными для последующей проверки
+        # Создаем authorization code
+        code = generate_token()
         authorization_codes[code] = {
             "client_id": client_id,
             "user_id": username,
             "scope": allowed_scope,
             "expires_at": time.time() + 300,  # 5 минут
-            "code_challenge": code_challenge,  # Для PKCE
+            "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
-            "redirect_uri": redirect_uri,  # ← КРИТИЧЕСКИ ВАЖНО!
-            "state": state  # Для CSRF защиты
+            "redirect_uri": redirect_uri,
+            "state": state
         }
 
-        # Очищаем данные сессии
-        session.pop("authorize_data", None)
-        session.pop("auth_error", None)
+        # Удаляем использованный auth token
+        del auth_requests[auth_token]
 
-        # Формируем URL для redirect с кодом
+        # Формируем URL для redirect
         redirect_url = f"{redirect_uri}?code={code}"
         if state:
             redirect_url += f"&state={state}"
@@ -410,254 +506,327 @@ def login_approve():
     except Exception as e:
         return f"❌ Ошибка сервера: {e}", 500
 
+
 @app.route("/token", methods=["POST"])
 def issue_token():
-    """Выдача токенов с поддержкой PKCE"""
+    """
+    OAuth 2.0 Token Endpoint
+    Выдает JWT access tokens и refresh tokens
+    Поддерживает: authorization_code, password, refresh_token grants
+    """
     data = request.form
     grant_type = data.get("grant_type")
 
-    # Password Grant (для мобильных приложений без браузера)
-    if grant_type == "password":
-        client_id = data.get("client_id")
-        client_secret = data.get("client_secret")
-        username = data.get("username")
-        password = data.get("password")
-        requested_scope = data.get("scope", "").split()
+    # Authorization Code Grant
+    if grant_type == "authorization_code":
+        return handle_authorization_code_grant(data)
 
-        # Проверяем клиента
-        if client_id not in clients:
-            return jsonify({"error": "invalid_client"}), 401
+    # Password Grant
+    elif grant_type == "password":
+        return handle_password_grant(data)
 
-        # Для confidential клиентов проверяем секрет
-        if clients[client_id]["type"] == "confidential":
-            if clients[client_id]["secret"] != client_secret:
-                return jsonify({"error": "invalid_client"}), 401
-
-        # Проверяем пользователя
-        if username not in users or users[username]["password"] != password:
-            return jsonify({"error": "invalid_grant"}), 401
-
-        # Проверяем scope
-        user_scopes = users[username]["scopes"]
-        allowed_scope = [s for s in requested_scope if s in user_scopes]
-
-        # Создаём токен
-        token = generate_token()
-        tokens[token] = {
-            "client_id": client_id,
-            "user_id": username,
-            "scope": allowed_scope,
-            "expires_at": time.time() + 3600  # 1 час
-        }
-
-        return jsonify({
-            "access_token": token,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "scope": " ".join(allowed_scope)
-        })
-
-    # Authorization Code Grant с PKCE
-    elif grant_type == "authorization_code":
-        code = data.get("code")
-        client_id = data.get("client_id")
-        client_secret = data.get("client_secret")  # Может быть None для public clients
-        code_verifier = data.get("code_verifier")  # PKCE параметр
-
-        # Проверяем клиента
-        if client_id not in clients:
-            return jsonify({"error": "invalid_client"}), 401
-
-        client_type = clients[client_id]["type"]
-
-        # 🔐 РАЗДЕЛЬНАЯ ПРОВЕРКА ДЛЯ РАЗНЫХ ТИПОВ КЛИЕНТОВ
-        if client_type == "confidential":
-            # Для confidential clients проверяем client_secret
-            if not client_secret or clients[client_id]["secret"] != client_secret:
-                return jsonify({"error": "invalid_client"}), 401
-        elif client_type == "public":
-            # Для public clients НЕ проверяем client_secret
-            # Они не должны его отправлять, но если отправили - игнорируем
-            pass
-        else:
-            return jsonify({"error": "invalid_client"}), 401
-
-        # Проверяем код авторизации
-        if code not in authorization_codes:
-            return jsonify({"error": "invalid_grant"}), 401
-
-        code_data = authorization_codes[code]
-
-        # Проверяем срок действия кода
-        if code_data["expires_at"] < time.time():
-            del authorization_codes[code]
-            return jsonify({"error": "invalid_grant"}), 401
-
-        if code_data["client_id"] != client_id:
-            return jsonify({"error": "invalid_grant"}), 401
-
-        # 🔐 ОБЯЗАТЕЛЬНАЯ PKCE ПРОВЕРКА ДЛЯ ВСЕХ КЛИЕНТОВ
-        if code_data.get("code_challenge"):
-            if not code_verifier:
-                return jsonify({
-                    "error": "invalid_grant",
-                    "error_description": "code_verifier required for PKCE"
-                }), 400
-
-            if not validate_pkce(code_verifier, code_data["code_challenge"], code_data["code_challenge_method"]):
-                return jsonify({
-                    "error": "invalid_grant",
-                    "error_description": "PKCE verification failed"
-                }), 400
-
-        # Удаляем использованный код
-        del authorization_codes[code]
-
-        # Создаём токен
-        token = generate_token()
-        tokens[token] = {
-            "client_id": client_id,
-            "user_id": code_data["user_id"],
-            "scope": code_data["scope"],
-            "expires_at": time.time() + 3600
-        }
-
-        return jsonify({
-            "access_token": token,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "scope": " ".join(code_data["scope"])
-        })
+    # Refresh Token Grant
+    elif grant_type == "refresh_token":
+        return handle_refresh_token_grant(data)
 
     else:
         return jsonify({"error": "unsupported_grant_type"}), 400
 
 
-# Остальные endpoints остаются без изменений
-@app.route("/verify_token", methods=["POST"])
-def verify_token():
-    """Проверка валидности токена"""
-    token = request.form.get("token")
+def handle_authorization_code_grant(data: Dict) -> jsonify:
+    """Обработка Authorization Code Grant flow"""
+    code = data.get("code")
+    client_id = data.get("client_id")
+    redirect_uri = data.get("redirect_uri")
+    code_verifier = data.get("code_verifier")
+    client_secret = data.get("client_secret")
 
-    # Проверяем отозванные токены
-    if token in revoked_tokens:
-        return jsonify({"valid": False, "reason": "revoked"}), 401
+    # Валидация параметров
+    if not code or not client_id or not redirect_uri:
+        return jsonify({"error": "invalid_request", "error_description": "Missing parameters"}), 400
 
-    # Проверяем существование токена
-    if token not in tokens:
-        return jsonify({"valid": False, "reason": "not_found"}), 401
+    if client_id not in clients:
+        return jsonify({"error": "invalid_client"}), 401
 
-    token_data = tokens[token]
+    # Проверка authorization code
+    if code not in authorization_codes:
+        return jsonify({"error": "invalid_grant"}), 401
 
-    # Проверяем срок действия
-    if token_data["expires_at"] < time.time():
-        revoked_tokens.add(token)  # Автоматически отзываем просроченные
-        return jsonify({"valid": False, "reason": "expired"}), 401
+    code_data = authorization_codes[code]
+
+    # Проверка срока действия
+    if time.time() > code_data["expires_at"]:
+        del authorization_codes[code]
+        return jsonify({"error": "invalid_grant", "error_description": "Code expired"}), 401
+
+    # Проверка клиента и redirect_uri
+    if code_data["client_id"] != client_id or code_data["redirect_uri"] != redirect_uri:
+        return jsonify({"error": "invalid_grant"}), 401
+
+    # Проверка client_secret для confidential clients
+    client = clients[client_id]
+    if client["type"] == "confidential":
+        if not client_secret or client_secret != client["secret"]:
+            return jsonify({"error": "invalid_client"}), 401
+
+    # Проверка PKCE
+    if code_data.get("code_challenge"):
+        if not code_verifier:
+            return jsonify({"error": "invalid_grant", "error_description": "code_verifier required"}), 400
+        if not validate_pkce(code_verifier, code_data["code_challenge"], code_data["code_challenge_method"]):
+            return jsonify({"error": "invalid_grant", "error_description": "PKCE verification failed"}), 400
+
+    # Удаляем использованный код
+    del authorization_codes[code]
+
+    # Создаем токены
+    access_token = create_access_token(code_data["user_id"], client_id, code_data["scope"])
+    refresh_token, refresh_data = create_refresh_token(code_data["user_id"], client_id, code_data["scope"])
 
     return jsonify({
-        "valid": True,
-        "client_id": token_data["client_id"],
-        "user_id": token_data["user_id"],
-        "scope": token_data["scope"]
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": int(JWT_CONFIG["access_token_expiry"].total_seconds()),
+        "refresh_token": refresh_token,
+        "scope": " ".join(code_data["scope"])
     })
+
+
+def handle_password_grant(data: Dict) -> jsonify:
+    """Обработка Resource Owner Password Credentials Grant flow"""
+    client_id = data.get("client_id")
+    client_secret = data.get("client_secret")
+    username = data.get("username")
+    password = data.get("password")
+    requested_scope = data.get("scope", "").split()
+
+    # Валидация параметров
+    if not client_id or not username or not password:
+        return jsonify({"error": "invalid_request", "error_description": "Missing parameters"}), 400
+
+    if client_id not in clients:
+        return jsonify({"error": "invalid_client"}), 401
+
+    # Проверка client_secret для confidential clients
+    client = clients[client_id]
+    if client["type"] == "confidential":
+        if not client_secret or client_secret != client["secret"]:
+            return jsonify({"error": "invalid_client"}), 401
+
+    # Аутентификация пользователя
+    if username not in users or users[username]["password"] != password:
+        return jsonify({"error": "invalid_grant"}), 401
+
+    # Проверка scopes
+    user_scopes = users[username]["scopes"]
+    allowed_scope = [s for s in requested_scope if s in user_scopes] if requested_scope else user_scopes
+
+    # Создаем токены
+    access_token = create_access_token(username, client_id, allowed_scope)
+    refresh_token, refresh_data = create_refresh_token(username, client_id, allowed_scope)
+
+    return jsonify({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": int(JWT_CONFIG["access_token_expiry"].total_seconds()),
+        "refresh_token": refresh_token,
+        "scope": " ".join(allowed_scope)
+    })
+
+
+def handle_refresh_token_grant(data: Dict) -> jsonify:
+    """Обработка Refresh Token Grant flow"""
+    refresh_token = data.get("refresh_token")
+    client_id = data.get("client_id")
+    client_secret = data.get("client_secret")
+    requested_scope = data.get("scope", "").split()
+
+    if not refresh_token or not client_id:
+        return jsonify({"error": "invalid_request", "error_description": "Missing parameters"}), 400
+
+    if client_id not in clients:
+        return jsonify({"error": "invalid_client"}), 401
+
+    # Проверка client_secret для confidential clients
+    client = clients[client_id]
+    if client["type"] == "confidential":
+        if not client_secret or client_secret != client["secret"]:
+            return jsonify({"error": "invalid_client"}), 401
+
+    # Проверка refresh token
+    is_valid, token_data = verify_refresh_token(refresh_token)
+    if not is_valid:
+        return jsonify({"error": "invalid_grant"}), 401
+
+    # Проверка клиента
+    if token_data["client_id"] != client_id:
+        return jsonify({"error": "invalid_grant"}), 401
+
+    # Проверка scopes (если запрошены новые)
+    if requested_scope:
+        # Проверяем что запрошенные scope являются подмножеством оригинальных
+        if not all(scope in token_data["scopes"] for scope in requested_scope):
+            return jsonify({"error": "invalid_scope"}), 400
+        final_scopes = requested_scope
+    else:
+        final_scopes = token_data["scopes"]
+
+    # Создаем новые токены
+    access_token = create_access_token(token_data["user_id"], client_id, final_scopes)
+
+    return jsonify({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": int(JWT_CONFIG["access_token_expiry"].total_seconds()),
+        "scope": " ".join(final_scopes)
+    })
+
+
+@app.route("/verify_token", methods=["POST"])
+def verify_token():
+    """
+    Проверяет валидность JWT access token
+    Возвращает информацию о токене и пользователе
+    """
+    token = request.form.get("token")
+    if not token:
+        return jsonify({"valid": False, "error": "Token required"}), 400
+
+    is_valid, result = verify_jwt_token(token)
+
+    if is_valid:
+        return jsonify({
+            "valid": True,
+            "client_id": result["client_id"],
+            "user_id": result["sub"],
+            "scope": result["scopes"],
+            "expires_at": result["exp"]
+        })
+    else:
+        return jsonify({"valid": False, "error": result["error"]}), 401
 
 
 @app.route("/revoke", methods=["POST"])
 def revoke_token():
-    """Отзыв токена"""
-    data = request.form
-    token = data.get("token")
-    client_id = data.get("client_id")
-    client_secret = data.get("client_secret")
+    """
+    Отзывает токен (добавляет в blacklist)
+    Поддерживает отзыв как access, так и refresh токенов
+    """
+    token = request.form.get("token")
+    token_type_hint = request.form.get("token_type_hint", "access_token")
+    client_id = request.form.get("client_id")
+    client_secret = request.form.get("client_secret")
 
-    # Проверяем клиента
+    if not token or not client_id:
+        return jsonify({"error": "invalid_request"}), 400
+
     if client_id not in clients:
         return jsonify({"error": "invalid_client"}), 401
 
-    # Для confidential клиентов проверяем секрет
-    if clients[client_id]["type"] == "confidential":
-        if clients[client_id]["secret"] != client_secret:
+    # Проверка client_secret для confidential clients
+    client = clients[client_id]
+    if client["type"] == "confidential":
+        if not client_secret or client_secret != client["secret"]:
             return jsonify({"error": "invalid_client"}), 401
-    # Для public клиентов НЕ проверяем секрет
 
-    # Проверяем существование токена
-    if token not in tokens:
-        return jsonify({"error": "invalid_token"}), 400
+    # Отзыв токена
+    if token_type_hint == "refresh_token" and token in refresh_tokens:
+        # Проверяем принадлежность refresh token
+        if refresh_tokens[token]["client_id"] == client_id:
+            del refresh_tokens[token]
+            revoked_tokens.add(token)  # Добавляем в blacklist
+            return jsonify({"message": "Token revoked successfully"})
 
-    # Проверяем принадлежность токена
-    if tokens[token]["client_id"] != client_id:
-        return jsonify({"error": "token_belongs_to_another_client"}), 403
-
-    # Отзываем токен
+    # Для access tokens просто добавляем в blacklist
     revoked_tokens.add(token)
 
-    return jsonify({
-        "message": "Token revoked successfully",
-        "token": token[:10] + "..."
-    })
+    # Также проверяем, не является ли это refresh token'ом
+    if token in refresh_tokens and refresh_tokens[token]["client_id"] == client_id:
+        del refresh_tokens[token]
+
+    return jsonify({"message": "Token revoked successfully"})
 
 
-@app.route("/admin/tokens", methods=["GET"])
-def admin_tokens():
-    """Админ-панель управления токенами"""
-    # Базовая проверка авторизации
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return "🔒 Требуется авторизация", 401
-
-    token = auth_header.replace("Bearer ", "")
-
-    # Проверяем токен и права
-    if token not in tokens or "admin_panel" not in tokens[token]["scope"]:
-        return "❌ Недостаточно прав для доступа к админ-панели", 403
-
-    # Подготавливаем список токенов для отображения
-    tokens_list = []
-    for token_key, token_data in list(tokens.items())[:20]:  # Ограничиваем вывод
-        tokens_list.append((token_key, token_data))
-
-    return render_template_string(
-        ADMIN_TEMPLATE,
-        active_count=len(tokens),
-        revoked_count=len(revoked_tokens),
-        tokens_list=tokens_list
-    )
+@app.route("/refresh", methods=["POST"])
+def refresh_token():
+    """
+    Альтернативный endpoint для обновления токенов
+    (Дублирует функциональность grant_type=refresh_token в /token)
+    """
+    return handle_refresh_token_grant(request.form)
 
 
-@app.route("/admin/revoke", methods=["POST"])
-def admin_revoke():
-    """Отзыв токена из админ-панели"""
-    token = request.form.get("token")
-
-    if token and token in tokens:
-        revoked_tokens.add(token)
-        return redirect("/admin/tokens")
-
-    return "❌ Токен не найден", 404
-
+# =============================================================================
+# УТИЛИТЫ И ОЧИСТКА
+# =============================================================================
 
 @app.route("/cleanup", methods=["POST"])
 def cleanup():
-    """Очистка просроченных токенов (для cron-задач)"""
+    """
+    Очистка устаревших данных
+    Удаляет просроченные authorization codes, refresh tokens и auth requests
+    """
     now = time.time()
-    expired_count = 0
+    expired_codes = 0
+    expired_refresh_tokens = 0
+    expired_auth_requests = 0
 
-    for token, data in list(tokens.items()):
-        if data["expires_at"] < now:
-            revoked_tokens.add(token)
-            del tokens[token]
-            expired_count += 1
-
-    # Очищаем просроченные коды авторизации
-    for code, data in list(authorization_codes.items()):
-        if data["expires_at"] < now:
+    # Очистка authorization codes
+    for code in list(authorization_codes.keys()):
+        if authorization_codes[code]["expires_at"] < now:
             del authorization_codes[code]
+            expired_codes += 1
+
+    # Очистка refresh tokens
+    for token in list(refresh_tokens.keys()):
+        if refresh_tokens[token]["expires_at"] < now:
+            del refresh_tokens[token]
+            expired_refresh_tokens += 1
+
+    # Очистка auth requests
+    for token in list(auth_requests.keys()):
+        if now - auth_requests[token]["timestamp"] > 300:  # 5 минут
+            del auth_requests[token]
+            expired_auth_requests += 1
 
     return jsonify({
         "message": "Cleanup completed",
-        "expired_tokens_removed": expired_count
+        "expired_authorization_codes": expired_codes,
+        "expired_refresh_tokens": expired_refresh_tokens,
+        "expired_auth_requests": expired_auth_requests
     })
 
 
+@app.before_request
+def handle_options():
+    """Обработка CORS preflight запросов"""
+    if request.method == "OPTIONS":
+        response = jsonify()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type")
+        response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        return response
+
+
+@app.after_request
+def after_request(response):
+    """Добавляет CORS headers ко всем ответам"""
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type")
+    response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return response
+
+
+# =============================================================================
+# ЗАПУСК СЕРВЕРА
+# =============================================================================
+
 if __name__ == "__main__":
+    print("🚀 Запуск OAuth 2.0 сервера с JWT поддержкой...")
+    print("📍 Сервер авторизации: http://127.0.0.1:5000")
+    print("🔐 Алгоритм JWT: HS256")
+    print("⏰ Время жизни access token: 15 минут")
+    print("🔄 Время жизни refresh token: 7 дней")
+    print("🔑 Используется stateless подход без сессий")
+
     app.run(port=5000, debug=True)
