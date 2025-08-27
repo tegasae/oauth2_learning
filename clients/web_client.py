@@ -624,15 +624,15 @@ def logout():
 
 @app.before_request
 def cleanup_pkce_store():
-    """Очистка устаревших PKCE данных"""
+    """Очистка устаревших PKCE данных с TTL 5 минут"""
     current_time = time.time()
-    expired_keys = []
 
-    for key, data in pkce_store.items():
-        if current_time - data["created_at"] > 300:
-            expired_keys.append(key)
+    # Создаем список ключей для удаления
+    keys_to_delete = [k for k, v in pkce_store.items()
+                      if current_time - v["created_at"] > 300]
 
-    for key in expired_keys:
+    # Удаляем все устаревшие ключи
+    for key in keys_to_delete:
         del pkce_store[key]
 
 
