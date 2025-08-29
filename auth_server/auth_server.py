@@ -816,7 +816,6 @@ def after_request(response):
     response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return response
 
-
 # =============================================================================
 # ЗАПУСК СЕРВЕРА
 # =============================================================================
