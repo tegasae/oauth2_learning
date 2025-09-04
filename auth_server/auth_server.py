@@ -397,19 +397,14 @@ def authorize():
     }
 
     # Показываем форму авторизации
+
+
+
     return render_template_string(
         LOGIN_TEMPLATE,
-        auth_token=auth_token,
-        client_id=client_id,
-        client_name=client["name"],
-        redirect_uri=redirect_uri,
-        requested_scope=requested_scope,
-        requested_scope_str=" ".join(requested_scope),
-        code_challenge=code_challenge or "",
-        code_challenge_method=code_challenge_method,
-        state=state or ""
-    )
+        auth_token=auth_token
 
+    )
 
 @app.route("/login_approve", methods=["POST"])
 def login_approve():

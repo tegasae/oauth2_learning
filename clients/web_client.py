@@ -130,11 +130,19 @@ def refresh_access_token() -> bool:
     """
     Обновляет access token с помощью refresh token.
 
+    Выполняет проверки:
+    1. Наличие refresh token в сессии
+    2. Сетевые ошибки при запросе
+    3. Ответ сервера с обработкой отозванных токенов
+    4. Статус пользователя (активен/заблокирован)
+
     Returns:
         bool: True если токен успешно обновлен, False в случае ошибки
     """
+    # Проверяем наличие refresh token в сессии
     refresh_token = session.get("refresh_token")
     if not refresh_token:
+        print("❌ Refresh token отсутствует в сессии")
         return False
 
     try:
@@ -147,32 +155,127 @@ def refresh_access_token() -> bool:
                 "client_id": CLIENT_ID,
                 "client_secret": CLIENT_SECRET
             },
-            timeout=10
+            timeout=10  # 10 секунд таймаут
         )
 
+        # 🔍 Анализируем ответ сервера
         if token_response.status_code == 200:
+            # Успешное обновление токена
             token_data = token_response.json()
+
+            # Валидируем структуру ответа
+            if "access_token" not in token_data:
+                print("❌ В ответе отсутствует access_token")
+                return False
 
             # Сохраняем новые токены в сессии
             session["access_token"] = token_data["access_token"]
             session["granted_scope"] = token_data.get("scope", "").split()
 
-            # Обновляем refresh token если он был возвращен
+            # Обновляем refresh token если он был возвращен (rotation)
             if "refresh_token" in token_data:
                 session["refresh_token"] = token_data["refresh_token"]
+                print("🔄 Refresh token обновлен (rotation)")
 
             # Обновляем информацию из JWT payload
             is_valid, jwt_payload = validate_jwt_token(token_data["access_token"])
             if is_valid:
                 session["user_id"] = jwt_payload.get("sub", "unknown")
                 session["token_expiry"] = jwt_payload.get("exp", 0)
+                print(f"✅ Токен обновлен для пользователя: {jwt_payload.get('sub')}")
+            else:
+                # Устанавливаем значения по умолчанию если JWT невалиден
+                session["user_id"] = "unknown"
+                session["token_expiry"] = 0
+                print("⚠️ Токен обновлен, но JWT payload невалиден")
 
             return True
-        else:
+
+        # 🔴 Обработка ошибок сервера
+        elif token_response.status_code == 401:
+            # Токен отозван или невалиден
+            error_data = token_response.json()
+            error_message = error_data.get("error", "")
+
+            if "invalid_grant" in error_message or "revoked" in error_message:
+                print("❌ Refresh token отозван или невалиден")
+                # Очищаем сессию так как токен больше не работает
+                session.clear()
+                return False
+            else:
+                print(f"❌ Ошибка аутентификации: {error_message}")
+                return False
+
+        elif token_response.status_code == 400:
+            # Неверный запрос
+            error_data = token_response.json()
+            print(f"❌ Неверный запрос: {error_data.get('error', 'Unknown error')}")
             return False
 
-    except requests.exceptions.RequestException:
+        elif token_response.status_code == 403:
+            # Пользователь заблокирован или не имеет прав
+            print("❌ Доступ запрещен: пользователь заблокирован или не имеет прав")
+            session.clear()  # Очищаем сессию
+            return False
+
+        else:
+            # Другие ошибки сервера
+            print(f"❌ Ошибка сервера: {token_response.status_code}")
+            return False
+
+    except requests.exceptions.Timeout:
+        print("❌ Таймаут при обновлении токена")
         return False
+
+    except requests.exceptions.ConnectionError:
+        print("❌ Ошибка соединения с сервером авторизации")
+        return False
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Сетевая ошибка: {e}")
+        return False
+
+    except json.JSONDecodeError:
+        print("❌ Неверный JSON в ответе сервера")
+        return False
+
+    except Exception as e:
+        print(f"❌ Непредвиденная ошибка при обновлении токена: {e}")
+        return False
+
+
+def check_user_active(user_id: str) -> bool:
+    """
+    Проверяет активен ли пользователь на сервере авторизации.
+
+    Args:
+        user_id: ID пользователя для проверки
+
+    Returns:
+        bool: True если пользователь активен, False если заблокирован/удален
+    """
+    try:
+        # Отправляем запрос к защищенному endpoint на auth server
+        response = requests.get(
+            f"{AUTH_SERVER}/user/{user_id}/status",
+            headers={"Authorization": f"Bearer {session.get('access_token', '')}"},
+            timeout=5
+        )
+
+        if response.status_code == 200:
+            return response.json().get("active", True)
+        elif response.status_code == 404:
+            print(f"❌ Пользователь {user_id} не найден (удален)")
+            return False
+        else:
+            # При ошибке считаем пользователя активным (fail-open)
+            print(f"⚠️ Не удалось проверить статус пользователя: {response.status_code}")
+            return True
+
+    except requests.exceptions.RequestException:
+        # При сетевой ошибке считаем пользователя активным (fail-open)
+        print("⚠️ Ошибка сети при проверке статуса пользователя")
+        return True
 
 
 # =============================================================================
@@ -604,7 +707,7 @@ def callback():
                 "redirect_uri": REDIRECT_URI,
                 "code_verifier": code_verifier  # PKCE verification
             },
-            timeout=10
+            timeout=10000
         )
 
         # Обработка ошибок от сервера токенов
@@ -772,16 +875,15 @@ def check_token_validity():
     if request.path in protected_routes:
         access_token = session.get("access_token")
 
-        # Если нет токена - сразу на главную
         if not access_token:
             session.clear()
             return redirect(url_for("home"))
 
-        # Проверяем валидность токена с помощью СУЩЕСТВУЮЩЕЙ функции
+        # Проверяем валидность токена
         is_valid, jwt_payload = validate_jwt_token(access_token)
 
-        # Если токен невалиден, пытаемся обновить
         if not is_valid:
+            # Пытаемся обновить токен
             if not refresh_access_token():
                 session.clear()
                 return redirect(url_for("home"))
@@ -790,10 +892,63 @@ def check_token_validity():
                 access_token = session["access_token"]
                 is_valid, jwt_payload = validate_jwt_token(access_token)
 
+        # ✅ Дополнительная проверка: активен ли пользователь
+        user_id = jwt_payload.get("sub")
+        if user_id and not check_user_active(user_id):
+            print(f"❌ Пользователь {user_id} заблокирован или удален")
+            session.clear()
+            return redirect(url_for("home"))
+
         # Сохраняем данные токена для использования в route
         from flask import g
         g.jwt_payload = jwt_payload
         g.access_token = access_token
+
+def check_user_status(user_id: str) -> bool:
+    """Проверяет активен ли пользователь на сервере"""
+    try:
+        response = requests.get(
+            f"{AUTH_SERVER}/user/{user_id}/status",
+            timeout=3
+        )
+        return response.status_code == 200 and response.json().get("active", False)
+    except:
+        return True  # При ошибке считаем пользователя активным
+
+
+def validate_jwt_token_with_server_check(token: str) -> Tuple[bool, Optional[dict]]:
+    """Проверяет токен с запросом к серверу при необходимости"""
+    # Сначала локальная проверка
+    is_valid, payload = validate_jwt_token(token)
+
+    if not is_valid:
+        return False, payload
+
+    # ✅ Периодически проверяем с сервером (раз в 5 минут)
+    last_check = session.get('last_server_validation', 0)
+    if time.time() - last_check > 300:  # 5 минут
+        try:
+            response = requests.post(
+                f"{AUTH_SERVER}/verify_token",
+                data={"token": token},
+                timeout=3
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if not data.get("valid"):
+                    # Сервер говорит что токен невалиден
+                    return False, {"error": "Token revoked by server"}
+
+                # Обновляем время последней проверки
+                session['last_server_validation'] = time.time()
+
+        except requests.exceptions.RequestException:
+            # При ошибке сети используем локальную проверку
+            pass
+
+    return True, payload
+
 
 
 # =============================================================================
