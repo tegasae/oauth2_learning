@@ -17,7 +17,7 @@ app.secret_key = "super-secret-jwt-key-2024"  # Для JWT подписи
 # JWT конфигурация
 JWT_CONFIG = {
     "algorithm": "HS256",
-    "access_token_expiry": datetime.timedelta(minutes=15),  # 15 минут
+    "access_token_expiry": datetime.timedelta(minutes=3),  # 15 минут
     "refresh_token_expiry": datetime.timedelta(days=7),  # 7 дней
     "issuer": "oauth2-auth-server",
     "audience": "resource-server"
@@ -36,6 +36,13 @@ clients = {
         "secret": "mobile_secret_456",
         "scopes": ["read_data"],
         "name": "Мобильное приложение",
+        "type": "public",
+        "redirect_uris": ["http://127.0.0.1:5004/callback"]
+    },
+    "api_app": {
+        "secret": "api_secret_789",
+        "scopes": ["read_data"],
+        "name": "Сервер api",
         "type": "public",
         "redirect_uris": ["http://127.0.0.1:5004/callback"]
     }
@@ -523,7 +530,8 @@ def issue_token():
     # Refresh Token Grant
     elif grant_type == "refresh_token":
         return handle_refresh_token_grant(data)
-
+    elif grant_type== "client_credentials":
+        return handle_client_credentials_grant(request.form)
     else:
         return jsonify({"error": "unsupported_grant_type"}), 400
 
@@ -675,6 +683,35 @@ def handle_refresh_token_grant(data: Dict) -> jsonify:
         "expires_in": int(JWT_CONFIG["access_token_expiry"].total_seconds()),
         "scope": " ".join(final_scopes)
     })
+
+
+def handle_client_credentials_grant(data: Dict) -> jsonify:
+    """Обработка Client Credentials Grant"""
+    client_id = data.get("client_id")
+    client_secret = data.get("client_secret")
+
+    if not client_id or not client_secret:
+        return jsonify({"error": "invalid_request"}), 400
+
+    if client_id not in clients or clients[client_id]["secret"] != client_secret:
+        return jsonify({"error": "invalid_client"}), 401
+
+    client = clients[client_id]
+
+    # Создаем токен с scopes клиента
+    access_token = create_access_token(
+        user_id="",  # ✅ Без пользователя!
+        client_id=client_id,
+        scopes=client["scopes"]  # Scopes из конфигурации клиента
+    )
+
+    return jsonify({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": int(JWT_CONFIG["access_token_expiry"].total_seconds()),
+        "scope": " ".join(client["scopes"])
+    })
+
 
 
 @app.route("/verify_token", methods=["POST"])

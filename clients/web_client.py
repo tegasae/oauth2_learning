@@ -31,7 +31,7 @@ import base64
 import time
 import jwt
 import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -117,7 +117,8 @@ def validate_jwt_token(token: str) -> Tuple[bool, Optional[dict]]:
         )
 
         # Проверяем expiration claim
-        if "exp" in payload and payload["exp"] < datetime.datetime.utcnow().timestamp():
+
+        if "exp" in payload and payload["exp"] < datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).timestamp():
             return False, {"error": "Token expired"}
 
         return True, payload
@@ -244,38 +245,6 @@ def refresh_access_token() -> bool:
         return False
 
 
-def check_user_active(user_id: str) -> bool:
-    """
-    Проверяет активен ли пользователь на сервере авторизации.
-
-    Args:
-        user_id: ID пользователя для проверки
-
-    Returns:
-        bool: True если пользователь активен, False если заблокирован/удален
-    """
-    try:
-        # Отправляем запрос к защищенному endpoint на auth server
-        response = requests.get(
-            f"{AUTH_SERVER}/user/{user_id}/status",
-            headers={"Authorization": f"Bearer {session.get('access_token', '')}"},
-            timeout=5
-        )
-
-        if response.status_code == 200:
-            return response.json().get("active", True)
-        elif response.status_code == 404:
-            print(f"❌ Пользователь {user_id} не найден (удален)")
-            return False
-        else:
-            # При ошибке считаем пользователя активным (fail-open)
-            print(f"⚠️ Не удалось проверить статус пользователя: {response.status_code}")
-            return True
-
-    except requests.exceptions.RequestException:
-        # При сетевой ошибке считаем пользователя активным (fail-open)
-        print("⚠️ Ошибка сети при проверке статуса пользователя")
-        return True
 
 
 # =============================================================================
@@ -516,13 +485,9 @@ DASHBOARD_TEMPLATE = """
                 {% endif %}
             </div>
 
-            <div class="scope-item {% if 'write_data' in granted_scope %}scope-active{% else %}scope-inactive{% endif %}">
-                ✏️ write_data
-                {% if 'write_data' in granted_scope %}
-                <span class="badge badge-success">Доступно</span>
-                {% else %}
-                <span class="badge badge-danger">Недоступно</span>
-                {% endif %}
+            <div class="scope-item {% if 'write_data' in granted_scope %}scope-active{% else %}scope-inactive{% endif 
+            %}"> ✏️ write_data {% if 'write_data' in granted_scope %} <span class="badge 
+            badge-success">Доступно</span> {% else %} <span class="badge badge-danger">Недоступно</span> {% endif %} 
             </div>
 
             <div class="scope-item {% if 'admin_panel' in granted_scope %}scope-active{% else %}scope-inactive{% endif %}">
@@ -894,26 +859,15 @@ def check_token_validity():
 
         # ✅ Дополнительная проверка: активен ли пользователь
         user_id = jwt_payload.get("sub")
-        if user_id and not check_user_active(user_id):
-            print(f"❌ Пользователь {user_id} заблокирован или удален")
-            session.clear()
-            return redirect(url_for("home"))
 
         # Сохраняем данные токена для использования в route
         from flask import g
         g.jwt_payload = jwt_payload
         g.access_token = access_token
 
-def check_user_status(user_id: str) -> bool:
-    """Проверяет активен ли пользователь на сервере"""
-    try:
-        response = requests.get(
-            f"{AUTH_SERVER}/user/{user_id}/status",
-            timeout=3
-        )
-        return response.status_code == 200 and response.json().get("active", False)
-    except:
-        return True  # При ошибке считаем пользователя активным
+
+
+
 
 
 def validate_jwt_token_with_server_check(token: str) -> Tuple[bool, Optional[dict]]:
@@ -948,7 +902,6 @@ def validate_jwt_token_with_server_check(token: str) -> Tuple[bool, Optional[dic
             pass
 
     return True, payload
-
 
 
 # =============================================================================
